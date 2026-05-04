@@ -1,32 +1,16 @@
-"""Your submission entry point — replace the baseline model here.
+"""Submission entry point.
 
-Contract (do NOT change the signature):
+predict(request) → dict  — do not change the signature.
 
-    predict(request: dict) -> dict
-
-Input: one request dict (keys below). Output: a dict with intent probability
-and 4 future bounding boxes.
-
-Request keys (all required):
-    ped_id                str       opaque token, stable within the dataset
-    frame_w, frame_h      int
-    time_of_day, weather, location   str  (may be empty strings)
-    ego_available         bool      True when ego speed/yaw history is valid
-    bbox_history          list[16][4]  past bboxes at 15 Hz, oldest → current
-                                       each bbox is [x1, y1, x2, y2] in pixels
-    ego_speed_history     list[16]  past ego speeds (m/s); zeros if unavailable
-    ego_yaw_history       list[16]  past yaw rates (rad/s); zeros if unavailable
-    requested_at_frame    int       native-30fps frame id of current observation
-
-Output keys (all required):
-    intent                float     P(crossing within next 2s), in [0, 1]
-    bbox_500ms            list[4]   predicted bbox at +0.5 s
-    bbox_1000ms           list[4]   predicted bbox at +1.0 s
-    bbox_1500ms           list[4]   predicted bbox at +1.5 s
-    bbox_2000ms           list[4]   predicted bbox at +2.0 s
-
-The grader calls predict() once per request, row-by-row. Prediction order
-must match input order.
+Improvements vs baseline:
+- 62-feature engineering: keeps the 20 baseline features, adds per-frame
+  velocity sequence (30 values) and 12 genuinely new summary features.
+  Giving the model the full velocity history lets trees learn temporal
+  patterns (e.g. "decelerating in the last 3 frames") that summary stats
+  miss.
+- Trajectory: CV_4 (baseline) is empirically optimal for CPU-only inference;
+  all regression/polynomial variants tested worse on dev.
+- LightGBM intent classifier (see train.py).
 """
 
 from __future__ import annotations
@@ -43,6 +27,27 @@ HORIZON_KEYS = ["bbox_500ms", "bbox_1000ms", "bbox_1500ms", "bbox_2000ms"]
 _cached_model = None
 
 
+class EnsembleClassifier:
+    """Weighted average of multiple classifier predict_proba outputs.
+
+    Stored in model.pkl so predict() works without changes.
+    Weights default to uniform if not set.
+    """
+
+    def __init__(self, classifiers: list):
+        self.classifiers = classifiers
+        self.weights: list | None = None  # set by train.py after construction
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        probs = np.stack([c.predict_proba(X)[:, 1] for c in self.classifiers])
+        if self.weights is not None:
+            w = np.asarray(self.weights, dtype=np.float64)
+            avg = (probs * w[:, None]).sum(axis=0) / w.sum()
+        else:
+            avg = probs.mean(axis=0)
+        return np.column_stack([1.0 - avg, avg])
+
+
 def _load_model():
     global _cached_model
     if _cached_model is None:
@@ -52,37 +57,34 @@ def _load_model():
 
 
 def _as_2d(x) -> np.ndarray:
-    """Coerce list-of-lists / object-array-of-arrays to (N, 4) float64."""
     return np.stack([np.asarray(r, dtype=np.float64) for r in x])
 
 
 def _engineered_features(req: dict) -> np.ndarray:
-    """Mirrors baseline.py's feature builder so the XGBoost model sees the same
-    layout at inference as at training. Keep this in lock-step with baseline.py.
-    """
     hist = _as_2d(req["bbox_history"])  # (16, 4)
     cx = (hist[:, 0] + hist[:, 2]) * 0.5
     cy = (hist[:, 1] + hist[:, 3]) * 0.5
     w = hist[:, 2] - hist[:, 0]
     h = hist[:, 3] - hist[:, 1]
-    vx = np.diff(cx)
-    vy = np.diff(cy)
-
-    ego_s = np.asarray(req["ego_speed_history"], dtype=np.float64)
-    ego_y = np.asarray(req["ego_yaw_history"], dtype=np.float64)
+    vx = np.diff(cx)  # (15,) per-frame x-velocity
+    vy = np.diff(cy)  # (15,) per-frame y-velocity
 
     fw = float(req["frame_w"])
     fh = float(req["frame_h"])
-    feats = [
+    ego_s = np.asarray(req["ego_speed_history"], dtype=np.float64)
+    ego_y = np.asarray(req["ego_yaw_history"], dtype=np.float64)
+
+    # ── block A: original 20 baseline features ──────────────────────────
+    feats_baseline = [
         cx[-1] / fw,
         cy[-1] / fh,
         w[-1] / fw,
         h[-1] / fh,
         vx[-4:].mean() / fw,
         vy[-4:].mean() / fh,
-        vx.std() / fw,                            # normalized per frame width
-        vy.std() / fh,                            # normalized per frame height
-        (h / (w + 1e-6)).mean(),                  # aspect ratio (tallness)
+        vx.std() / fw,
+        vy.std() / fh,
+        (h / (w + 1e-6)).mean(),
         float(req["ego_available"]),
         ego_s.mean(), ego_s[-1], ego_s.max(),
         ego_y.mean(), ego_y[-1], np.abs(ego_y).max(),
@@ -91,16 +93,54 @@ def _engineered_features(req: dict) -> np.ndarray:
         1.0 if req.get("weather") == "rain" else 0.0,
         1.0 if req.get("weather") == "snow" else 0.0,
     ]
-    return np.asarray(feats, dtype=np.float32)
+
+    # ── block B: full per-frame velocity sequence (30 features) ─────────
+    # Trees can learn temporal patterns (deceleration, direction flip) from
+    # the raw sequence that summary statistics miss.
+    feats_seq = list(vx / fw) + list(vy / fh)  # 15 + 15 = 30
+
+    # ── block C: 12 genuinely new summary features ───────────────────────
+    speed4 = float(np.hypot(vx[-4:].mean(), vy[-4:].mean()))  # speed magnitude
+    speed_r2 = float(np.hypot(vx[-2:].mean(), vy[-2:].mean()))
+    speed_old = float(np.hypot(vx[-6:-2].mean(), vy[-6:-2].mean()))
+
+    feats_new = [
+        # speed magnitude (not captured by vx/vy separately)
+        speed4 / max(fw, fh),
+        # speed change: negative = decelerating (key crossing signal)
+        (speed_r2 - speed_old) / max(fw, fh),
+        # net displacement over full 1.07 s window
+        (cx[-1] - cx[0]) / fw,
+        (cy[-1] - cy[0]) / fh,
+        float(np.hypot(cx[-1] - cx[0], cy[-1] - cy[0])) / max(fw, fh),
+        # bbox size trend (pedestrian approaching camera = getting bigger)
+        (h[-1] - h[0]) / fh,
+        (w[-1] - w[0]) / fw,
+        # position relative to horizontal center (approaching road center)
+        abs(cx[-1] - fw * 0.5) / (fw * 0.5),
+        # moving toward horizontal center? (positive = yes)
+        float(np.sign(fw * 0.5 - cx[-1]) * vx[-4:].mean()) / fw,
+        # ego deceleration (negative = ego slowing; may yield for crossing ped)
+        float((ego_s[-1] - ego_s.mean()) * float(req["ego_available"])),
+        # velocity consistency: how erratic is the walk?
+        float(1.0 - np.hypot(vx, vy).std() / (np.hypot(vx, vy).mean() + 1e-6)),
+        # location flag (only ~6% of data has "street" but it's a real signal)
+        1.0 if req.get("location") == "street" else 0.0,
+    ]
+
+    all_feats = feats_baseline + feats_seq + feats_new  # 20 + 30 + 12 = 62
+    arr = np.asarray(all_feats, dtype=np.float32)
+    return arr
 
 
 def _constant_velocity_trajectory(req: dict) -> dict[str, list[float]]:
-    hist = _as_2d(req["bbox_history"])  # (16, 4)
+    """CV_4: mean velocity over last 4 intervals. Empirically beats all
+    regression variants on this dataset (shorter windows add noise)."""
+    hist = _as_2d(req["bbox_history"])
     cx = (hist[:, 0] + hist[:, 2]) * 0.5
     cy = (hist[:, 1] + hist[:, 3]) * 0.5
     w_last = hist[-1, 2] - hist[-1, 0]
     h_last = hist[-1, 3] - hist[-1, 1]
-    # mean per-frame velocity over last 4 intervals
     vx = float(np.diff(cx[-5:]).mean())
     vy = float(np.diff(cy[-5:]).mean())
     cur_cx, cur_cy = float(cx[-1]), float(cy[-1])
